@@ -1,0 +1,30 @@
+# Binaries
+mrf-processor
+process_mrf_fast
+process_mrf
+
+# Output directories
+output_csv/
+output_csv_fast/
+Processed_Files/
+
+# Raw data
+Raw_Files/
+
+# Python virtual environment
+.venv/
+
+# IDE and OS files
+.DS_Store
+.vscode/
+.idea/
+
+# Go specific
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+go.work 
