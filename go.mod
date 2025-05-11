@@ -5,6 +5,8 @@ go 1.23.0
 toolchain go1.23.9
 
 require (
+	github.com/apache/arrow/go/arrow v0.0.0-20211112161151-bc219186db40 // indirect
+	github.com/apache/thrift v0.14.2 // indirect
 	github.com/aws/aws-sdk-go-v2 v1.36.3 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.6.10 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.29.14 // indirect
@@ -24,5 +26,11 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.33.19 // indirect
 	github.com/aws/smithy-go v1.22.2 // indirect
 	github.com/edsrzf/mmap-go v1.2.0 // indirect
+	github.com/golang/snappy v1.0.0 // indirect
+	github.com/klauspost/compress v1.18.0 // indirect
+	github.com/pierrec/lz4/v4 v4.1.22 // indirect
+	github.com/xitongsys/parquet-go v1.6.2 // indirect
+	github.com/xitongsys/parquet-go-source v0.0.0-20241021075129-b732d2ac9c9b // indirect
 	golang.org/x/sys v0.33.0 // indirect
+	golang.org/x/xerrors v0.0.0-20200804184101-5ec99f83aff1 // indirect
 )

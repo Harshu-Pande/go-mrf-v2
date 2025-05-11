@@ -569,6 +569,7 @@ func (pool *FileWriterPool) Close() error {
 	pool.mu.Lock()
 	defer pool.mu.Unlock()
 
+	// Close all writers first
 	var lastErr error
 	for _, writer := range pool.writers {
 		if err := writer.Close(); err != nil {
@@ -586,11 +587,32 @@ func (pool *FileWriterPool) Close() error {
 		var uploadErr error
 		var uploadErrMu sync.Mutex
 
-		// Get a list of all files to upload
-		var filesToUpload []string
-		for path := range pool.writers {
-			filesToUpload = append(filesToUpload, path)
+		// Get output directory from first writer
+		var outputDir string
+		for _, writer := range pool.writers {
+			outputDir = filepath.Dir(filepath.Dir(writer.file.Name()))
+			break
 		}
+		if outputDir == "" {
+			return fmt.Errorf("no output directory found")
+		}
+
+		// Walk through the output directory to find all files
+		var filesToUpload []string
+		err := filepath.Walk(outputDir, func(path string, info os.FileInfo, err error) error {
+			if err != nil {
+				return err
+			}
+			if !info.IsDir() && strings.HasSuffix(path, ".csv") {
+				filesToUpload = append(filesToUpload, path)
+			}
+			return nil
+		})
+		if err != nil {
+			return fmt.Errorf("failed to walk output directory: %v", err)
+		}
+
+		fmt.Printf("Found %d files to upload\n", len(filesToUpload))
 
 		// Upload each file concurrently
 		for _, filePath := range filesToUpload {
