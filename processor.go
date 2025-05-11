@@ -18,6 +18,7 @@ import (
 type ProcessorConfig struct {
 	WriteBufferSize int
 	NumWorkers      int
+	KeepLocal       bool
 }
 
 // DefaultConfig returns the default processor configuration
@@ -25,14 +26,15 @@ func DefaultConfig() ProcessorConfig {
 	return ProcessorConfig{
 		WriteBufferSize: 1024 * 1024, // 1MB write buffer
 		NumWorkers:      runtime.NumCPU(),
+		KeepLocal:       true,
 	}
 }
 
-var config ProcessorConfig
+var processorConfig ProcessorConfig
 
 // SetConfig sets the processor configuration
 func SetConfig(cfg ProcessorConfig) {
-	config = cfg
+	processorConfig = cfg
 }
 
 // Constants for optimization
@@ -57,22 +59,26 @@ type Result struct {
 
 // FileWriter handles buffered writing to files
 type FileWriter struct {
-	file       *os.File
-	writer     *bufio.Writer
-	mu         sync.Mutex
-	written    int64
-	lastUse    time.Time
-	buffer     []byte
-	bufferSize int
+	file         *os.File
+	writer       *bufio.Writer
+	mu           sync.Mutex
+	written      int64
+	lastUse      time.Time
+	buffer       []byte
+	bufferSize   int
+	r2Config     *R2Config
+	remotePrefix string
 }
 
 // Pool of FileWriters with LRU cache
 type FileWriterPool struct {
-	writers     map[string]*FileWriter
-	mu          sync.RWMutex
-	maxWriters  int
-	bufferSize  int
-	writeBuffer chan writeRequest
+	writers      map[string]*FileWriter
+	mu           sync.RWMutex
+	maxWriters   int
+	bufferSize   int
+	writeBuffer  chan writeRequest
+	r2Config     *R2Config
+	remotePrefix string
 }
 
 type writeRequest struct {
@@ -145,10 +151,12 @@ func (pool *FileWriterPool) getOrCreateWriter(filename string) (*FileWriter, err
 	}
 
 	writer = &FileWriter{
-		file:       file,
-		writer:     bufio.NewWriterSize(file, pool.bufferSize),
-		lastUse:    time.Now(),
-		bufferSize: pool.bufferSize,
+		file:         file,
+		writer:       bufio.NewWriterSize(file, pool.bufferSize),
+		lastUse:      time.Now(),
+		bufferSize:   pool.bufferSize,
+		r2Config:     pool.r2Config,
+		remotePrefix: pool.remotePrefix,
 	}
 
 	// Write header if file is new (size is 0)
@@ -213,7 +221,13 @@ func (fw *FileWriter) Close() error {
 	if err := fw.writer.Flush(); err != nil {
 		return err
 	}
-	return fw.file.Close()
+
+	// Close the file
+	if err := fw.file.Close(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func (pool *FileWriterPool) closeLeastRecentlyUsed() error {
@@ -361,16 +375,16 @@ func processInNetworkItem(item InNetworkItem, outputDir string, writerPool *File
 
 func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *FileWriterPool) error {
 	// Create a buffered channel for items
-	itemChan := make(chan InNetworkItem, config.NumWorkers*2)
+	itemChan := make(chan InNetworkItem, processorConfig.NumWorkers*2)
 	errChan := make(chan error, 1)
 	var wg sync.WaitGroup
 	var itemCount int64
 
 	// Start worker goroutines
-	fmt.Printf("Starting %d workers for parallel processing...\n", config.NumWorkers)
+	fmt.Printf("Starting %d workers for parallel processing...\n", processorConfig.NumWorkers)
 	os.Stdout.Sync() // Force flush stdout
 
-	for i := 0; i < config.NumWorkers; i++ {
+	for i := 0; i < processorConfig.NumWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
@@ -439,7 +453,7 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 	return nil
 }
 
-func ProcessFile(inputFile, outputDir string) error {
+func ProcessFile(inputFile, outputDir string, r2Config *R2Config, remotePrefix string) error {
 	fmt.Printf("Starting processing with %d CPU cores...\n", runtime.NumCPU())
 
 	// Create output directory if it doesn't exist
@@ -447,8 +461,10 @@ func ProcessFile(inputFile, outputDir string) error {
 		return fmt.Errorf("failed to create output directory: %v", err)
 	}
 
-	// Initialize the writer pool
+	// Initialize the writer pool with R2 config
 	writerPool := NewFileWriterPool(runtime.NumCPU())
+	writerPool.r2Config = r2Config
+	writerPool.remotePrefix = remotePrefix
 	defer writerPool.Close()
 
 	// Create CSV files with headers
@@ -559,5 +575,60 @@ func (pool *FileWriterPool) Close() error {
 			lastErr = err
 		}
 	}
+
+	// If R2 upload is enabled, upload all files after processing
+	if pool.r2Config != nil {
+		fmt.Printf("\nUploading files to R2 bucket %s...\n", pool.r2Config.BucketName)
+
+		// Create a channel to limit concurrent uploads
+		sem := make(chan struct{}, 10) // Allow 10 concurrent uploads
+		var wg sync.WaitGroup
+		var uploadErr error
+		var uploadErrMu sync.Mutex
+
+		// Get a list of all files to upload
+		var filesToUpload []string
+		for path := range pool.writers {
+			filesToUpload = append(filesToUpload, path)
+		}
+
+		// Upload each file concurrently
+		for _, filePath := range filesToUpload {
+			wg.Add(1)
+			go func(path string) {
+				defer wg.Done()
+				sem <- struct{}{}        // Acquire semaphore
+				defer func() { <-sem }() // Release semaphore
+
+				// Upload the file
+				if err := pool.r2Config.UploadFile(path, pool.remotePrefix); err != nil {
+					uploadErrMu.Lock()
+					uploadErr = err
+					uploadErrMu.Unlock()
+					fmt.Printf("Error uploading %s: %v\n", path, err)
+					return
+				}
+
+				// If we're not keeping local files, delete after successful upload
+				if !processorConfig.KeepLocal {
+					if err := os.Remove(path); err != nil {
+						fmt.Printf("Warning: Failed to remove local file %s after R2 upload: %v\n", path, err)
+					}
+				}
+
+				fmt.Printf("Uploaded %s\n", path)
+			}(filePath)
+		}
+
+		// Wait for all uploads to complete
+		wg.Wait()
+
+		if uploadErr != nil {
+			return fmt.Errorf("some files failed to upload: %v", uploadErr)
+		}
+
+		fmt.Printf("All files uploaded to R2 bucket: %s with prefix: %s\n", pool.r2Config.BucketName, pool.remotePrefix)
+	}
+
 	return lastErr
 }
