@@ -1,13 +1,16 @@
 # MRF JSON Processor
 
-A high-performance Go program for processing Machine-Readable Files (MRF) from healthcare price transparency data. This tool efficiently processes large gzipped JSON files using parallel processing and streaming techniques.
+A high-performance Go program for processing Machine-Readable Files (MRF) from healthcare price transparency data. This tool efficiently processes large gzipped JSON files using parallel processing, memory-mapped I/O, and streaming techniques.
 
 ## Features
 
-- Parallel processing using all available CPU cores
+- Parallel processing using configurable worker threads
 - Memory-efficient streaming JSON processing
+- Memory-mapped I/O for better performance
+- Optimized file writing with buffer pools
+- Automatic system resource limit optimization
 - Handles large gzipped files
-- Configurable input/output paths
+- Configurable buffer sizes and worker counts
 - CSV output format for easy analysis
 
 ## Requirements
@@ -42,7 +45,7 @@ Options:
 
 Example:
 ```bash
-./mrf-processor input.json.gz output/
+./mrf-processor -workers 8 -buffer 4 input.json.gz output/
 ```
 
 ## Output Format
@@ -63,13 +66,15 @@ The program generates two CSV files in the output directory:
    - negotiated_type: Type of negotiated rate
    - billing_class: Billing class
 
-## Performance
+## Performance Features
 
-The program is optimized for performance:
-- Uses parallel processing with multiple worker threads
+The program is highly optimized for performance:
+- Uses memory-mapped I/O for efficient file handling
+- Implements parallel processing with configurable worker threads
+- Uses buffer pools for optimized file writing
+- Automatically adjusts system resource limits
 - Streams JSON data to minimize memory usage
-- Buffers file writes for better I/O performance
-- Automatically uses all available CPU cores
+- Uses efficient data structures for processing
 
 ## License
 

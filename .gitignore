@@ -1,4 +1,7 @@
-
+# Binaries
+mrf-processor
+process_mrf_fast
+process_mrf
 
 # Output directories
 output_csv/

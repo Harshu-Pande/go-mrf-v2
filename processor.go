@@ -8,8 +8,10 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
 // ProcessorConfig holds configuration for the processor
@@ -55,22 +57,143 @@ type Result struct {
 
 // FileWriter handles buffered writing to files
 type FileWriter struct {
-	file    *os.File
-	writer  *bufio.Writer
-	mu      sync.Mutex
-	written int64
+	file       *os.File
+	writer     *bufio.Writer
+	mu         sync.Mutex
+	written    int64
+	lastUse    time.Time
+	buffer     []byte
+	bufferSize int
 }
 
-// Pool of FileWriters
+// Pool of FileWriters with LRU cache
 type FileWriterPool struct {
-	writers map[string]*FileWriter
-	mu      sync.RWMutex
+	writers     map[string]*FileWriter
+	mu          sync.RWMutex
+	maxWriters  int
+	bufferSize  int
+	writeBuffer chan writeRequest
+}
+
+type writeRequest struct {
+	filename string
+	data     []byte
+	errChan  chan error
+}
+
+// NewFileWriterPool creates a new pool with a maximum number of writers
+func NewFileWriterPool(maxWriters int) *FileWriterPool {
+	pool := &FileWriterPool{
+		writers:     make(map[string]*FileWriter),
+		maxWriters:  maxWriters,
+		bufferSize:  8 * 1024 * 1024, // 8MB buffer for better performance
+		writeBuffer: make(chan writeRequest, maxWriters*2),
+	}
+
+	// Start background writer
+	go pool.backgroundWriter()
+	return pool
+}
+
+func (pool *FileWriterPool) backgroundWriter() {
+	for req := range pool.writeBuffer {
+		writer, err := pool.getOrCreateWriter(req.filename)
+		if err != nil {
+			req.errChan <- err
+			continue
+		}
+
+		_, err = writer.Write(req.data)
+		req.errChan <- err
+	}
+}
+
+func (pool *FileWriterPool) getOrCreateWriter(filename string) (*FileWriter, error) {
+	// Try read lock first
+	pool.mu.RLock()
+	writer, exists := pool.writers[filename]
+	pool.mu.RUnlock()
+	if exists {
+		return writer, nil
+	}
+
+	// Need write lock
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	// Check again in case another goroutine created it
+	if writer, exists = pool.writers[filename]; exists {
+		return writer, nil
+	}
+
+	// If we've reached max writers, close least recently used
+	if len(pool.writers) >= pool.maxWriters {
+		if err := pool.closeLeastRecentlyUsed(); err != nil {
+			return nil, err
+		}
+	}
+
+	// Create directory if it doesn't exist
+	dir := filepath.Dir(filename)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create directory %s: %v", dir, err)
+	}
+
+	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file %s: %v", filename, err)
+	}
+
+	writer = &FileWriter{
+		file:       file,
+		writer:     bufio.NewWriterSize(file, pool.bufferSize),
+		lastUse:    time.Now(),
+		bufferSize: pool.bufferSize,
+	}
+
+	// Write header if file is new (size is 0)
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("failed to stat file: %v", err)
+	}
+
+	if info.Size() == 0 && strings.Contains(filename, "in_network_") {
+		header := "provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class\n"
+		if _, err := writer.Write([]byte(header)); err != nil {
+			return nil, fmt.Errorf("failed to write header: %v", err)
+		}
+	}
+
+	pool.writers[filename] = writer
+	return writer, nil
+}
+
+func (pool *FileWriterPool) WriteAsync(filename string, data []byte) error {
+	errChan := make(chan error, 1)
+	pool.writeBuffer <- writeRequest{
+		filename: filename,
+		data:     data,
+		errChan:  errChan,
+	}
+	return <-errChan
 }
 
 func (fw *FileWriter) Write(data []byte) (int, error) {
 	fw.mu.Lock()
 	defer fw.mu.Unlock()
-	n, err := fw.writer.Write(data)
+	fw.lastUse = time.Now()
+
+	// If buffer is nil or too small, create new one
+	if fw.buffer == nil || cap(fw.buffer) < len(data) {
+		fw.buffer = make([]byte, 0, max(len(data), 1024*1024))
+	}
+
+	// Reset buffer and copy data
+	fw.buffer = fw.buffer[:0]
+	fw.buffer = append(fw.buffer, data...)
+
+	// Write in a single operation
+	n, err := fw.writer.Write(fw.buffer)
 	if err != nil {
 		return n, fmt.Errorf("write error: %v", err)
 	}
@@ -84,54 +207,41 @@ func (fw *FileWriter) Flush() error {
 	return fw.writer.Flush()
 }
 
-func (pool *FileWriterPool) GetWriter(filename string) (*FileWriter, error) {
-	pool.mu.RLock()
-	writer, exists := pool.writers[filename]
-	pool.mu.RUnlock()
-	if exists {
-		return writer, nil
+func (fw *FileWriter) Close() error {
+	fw.mu.Lock()
+	defer fw.mu.Unlock()
+	if err := fw.writer.Flush(); err != nil {
+		return err
 	}
-
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
-
-	// Check again in case another goroutine created it
-	if writer, exists = pool.writers[filename]; exists {
-		return writer, nil
-	}
-
-	file, err := os.OpenFile(filename, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file %s: %v", filename, err)
-	}
-
-	writer = &FileWriter{
-		file:   file,
-		writer: bufio.NewWriterSize(file, config.WriteBufferSize),
-	}
-	pool.writers[filename] = writer
-	return writer, nil
+	return fw.file.Close()
 }
 
-func (pool *FileWriterPool) Close() error {
-	pool.mu.Lock()
-	defer pool.mu.Unlock()
+func (pool *FileWriterPool) closeLeastRecentlyUsed() error {
+	var lru *FileWriter
+	var lruKey string
+	var lruTime = time.Now()
 
-	var lastErr error
-	for _, writer := range pool.writers {
-		if err := writer.Flush(); err != nil {
-			lastErr = err
-		}
-		if err := writer.file.Close(); err != nil {
-			lastErr = err
+	// Find least recently used writer
+	for k, w := range pool.writers {
+		if w.lastUse.Before(lruTime) {
+			lru = w
+			lruKey = k
+			lruTime = w.lastUse
 		}
 	}
-	return lastErr
+
+	if lru != nil {
+		if err := lru.Close(); err != nil {
+			return fmt.Errorf("failed to close file: %v", err)
+		}
+		delete(pool.writers, lruKey)
+	}
+	return nil
 }
 
 func writeProviderGroups(group ProviderGroup, outputDir string, writerPool *FileWriterPool) error {
 	filename := filepath.Join(outputDir, "provider_groups.csv")
-	writer, err := writerPool.GetWriter(filename)
+	writer, err := writerPool.getOrCreateWriter(filename)
 	if err != nil {
 		return fmt.Errorf("failed to get writer for provider groups: %v", err)
 	}
@@ -189,10 +299,11 @@ func streamProviderReferences(decoder *json.Decoder, outputDir string, writerPoo
 }
 
 func writeNegotiatedRates(item InNetworkItem, rate NegotiatedRate, price NegotiatedPrice, providerRef int, outputDir string, writerPool *FileWriterPool) error {
-	filename := filepath.Join(outputDir, "negotiated_rates.csv")
-	writer, err := writerPool.GetWriter(filename)
+	// Create filename based on billing code
+	filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", item.BillingCode))
+	writer, err := writerPool.getOrCreateWriter(filename)
 	if err != nil {
-		return fmt.Errorf("failed to get writer for negotiated rates: %v", err)
+		return fmt.Errorf("failed to get writer for billing code %s: %v", item.BillingCode, err)
 	}
 
 	record := fmt.Sprintf("%d,%f,%s,%s,%s,%s,%s\n",
@@ -214,17 +325,36 @@ func writeNegotiatedRates(item InNetworkItem, rate NegotiatedRate, price Negotia
 // Worker function to process in-network items
 func processInNetworkItem(item InNetworkItem, outputDir string, writerPool *FileWriterPool, itemCount *int64) error {
 	count := atomic.AddInt64(itemCount, 1)
+
+	// Always print the item being processed
 	fmt.Printf("Processing in-network item %d: %s\n", count, item.BillingCode)
 
+	// Pre-allocate buffer for all records
+	var builder strings.Builder
+	builder.Grow(1024 * 8) // Pre-allocate 8KB
+
+	// Build all records in memory first
 	for _, rate := range item.NegotiatedRates {
 		for _, price := range rate.NegotiatedPrices {
 			for _, providerRef := range rate.ProviderReferences {
-				if err := writeNegotiatedRates(item, rate, price, providerRef, outputDir, writerPool); err != nil {
-					return err
-				}
+				fmt.Fprintf(&builder, "%d,%f,%s,%s,%s,%s,%s\n",
+					providerRef,
+					price.NegotiatedRate,
+					item.BillingCode,
+					item.BillingCodeType,
+					item.NegotiationArrangement,
+					price.NegotiatedType,
+					price.BillingClass)
 			}
 		}
 	}
+
+	// Write all records at once if we have any
+	if builder.Len() > 0 {
+		filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", item.BillingCode))
+		return writerPool.WriteAsync(filename, []byte(builder.String()))
+	}
+
 	return nil
 }
 
@@ -237,6 +367,7 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 
 	// Start worker goroutines
 	fmt.Printf("Starting %d workers for parallel processing...\n", config.NumWorkers)
+	os.Stdout.Sync() // Force flush stdout
 
 	for i := 0; i < config.NumWorkers; i++ {
 		wg.Add(1)
@@ -254,7 +385,10 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 		}()
 	}
 
-	// Read items and send to channel
+	// Process items and track performance
+	startTime := time.Now()
+	lastUpdateTime := startTime
+
 	go func() {
 		defer close(itemChan)
 		for decoder.More() {
@@ -267,11 +401,32 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 				return
 			}
 			itemChan <- item
+
+			// Update performance stats every 5 seconds
+			now := time.Now()
+			if now.Sub(lastUpdateTime) >= 5*time.Second {
+				current := atomic.LoadInt64(&itemCount)
+				elapsed := now.Sub(startTime).Seconds()
+				itemsPerSec := float64(current) / elapsed
+				fmt.Printf("\n--- Performance: %.1f items/sec (processed %d items in %.1f seconds) ---\n\n",
+					itemsPerSec, current, elapsed)
+				os.Stdout.Sync()
+				lastUpdateTime = now
+			}
 		}
 	}()
 
 	// Wait for all workers to finish
 	wg.Wait()
+
+	// Final statistics
+	totalTime := time.Since(startTime)
+	totalCount := atomic.LoadInt64(&itemCount)
+	itemsPerSec := float64(totalCount) / totalTime.Seconds()
+
+	fmt.Printf("\nCompleted processing %d items in %.1f seconds (%.1f items/sec)\n",
+		totalCount, totalTime.Seconds(), itemsPerSec)
+	os.Stdout.Sync()
 
 	// Check for errors
 	select {
@@ -280,12 +435,6 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 	default:
 	}
 
-	// Consume the array end token
-	if _, err := decoder.Token(); err != nil {
-		return fmt.Errorf("failed to read array end token: %v", err)
-	}
-
-	fmt.Printf("Processed %d in-network items using %d workers\n", atomic.LoadInt64(&itemCount), config.NumWorkers)
 	return nil
 }
 
@@ -298,9 +447,7 @@ func ProcessFile(inputFile, outputDir string) error {
 	}
 
 	// Initialize the writer pool
-	writerPool := &FileWriterPool{
-		writers: make(map[string]*FileWriter),
-	}
+	writerPool := NewFileWriterPool(runtime.NumCPU())
 	defer writerPool.Close()
 
 	// Create CSV files with headers
@@ -310,11 +457,7 @@ func ProcessFile(inputFile, outputDir string) error {
 	}
 
 	for filename, header := range headers {
-		writer, err := writerPool.GetWriter(filepath.Join(outputDir, filename))
-		if err != nil {
-			return fmt.Errorf("failed to create %s: %v", filename, err)
-		}
-		if _, err := writer.Write([]byte(header)); err != nil {
+		if err := writerPool.WriteAsync(filepath.Join(outputDir, filename), []byte(header)); err != nil {
 			return fmt.Errorf("failed to write header to %s: %v", filename, err)
 		}
 	}
@@ -393,4 +536,27 @@ func ProcessFile(inputFile, outputDir string) error {
 	}
 
 	return nil
+}
+
+// Helper function for max
+func max(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (pool *FileWriterPool) Close() error {
+	close(pool.writeBuffer)
+
+	pool.mu.Lock()
+	defer pool.mu.Unlock()
+
+	var lastErr error
+	for _, writer := range pool.writers {
+		if err := writer.Close(); err != nil {
+			lastErr = err
+		}
+	}
+	return lastErr
 }
