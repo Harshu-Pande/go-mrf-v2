@@ -239,7 +239,7 @@ func (pool *FileWriterPool) closeLeastRecentlyUsed() error {
 	return nil
 }
 
-func writeProviderGroups(group ProviderGroup, outputDir string, writerPool *FileWriterPool) error {
+func writeProviderGroups(group ProviderGroup, providerGroupID int, outputDir string, writerPool *FileWriterPool) error {
 	filename := filepath.Join(outputDir, "provider_groups.csv")
 	writer, err := writerPool.getOrCreateWriter(filename)
 	if err != nil {
@@ -264,7 +264,8 @@ func writeProviderGroups(group ProviderGroup, outputDir string, writerPool *File
 		}
 	}
 
-	record := fmt.Sprintf("%s,%s,%s\n",
+	record := fmt.Sprintf("%d,%s,%s,%s\n",
+		providerGroupID,
 		npiStr,
 		group.TIN.Type,
 		group.TIN.Value)
@@ -285,7 +286,7 @@ func streamProviderReferences(decoder *json.Decoder, outputDir string, writerPoo
 		}
 
 		for _, group := range ref.ProviderGroups {
-			if err := writeProviderGroups(group, outputDir, writerPool); err != nil {
+			if err := writeProviderGroups(group, ref.ProviderGroupID, outputDir, writerPool); err != nil {
 				return err
 			}
 		}
@@ -452,7 +453,7 @@ func ProcessFile(inputFile, outputDir string) error {
 
 	// Create CSV files with headers
 	headers := map[string]string{
-		"provider_groups.csv":  "npi,tin_type,tin_value\n",
+		"provider_groups.csv":  "provider_group_id,npi,tin_type,tin_value\n",
 		"negotiated_rates.csv": "provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class\n",
 	}
 
