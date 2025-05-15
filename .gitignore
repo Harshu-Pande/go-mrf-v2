@@ -4,6 +4,10 @@ process_mrf_fast
 process_mrf
 
 # Output directories
+Join_Files/
+joing_files/
+output
+Output/
 output_csv/
 output_csv_fast/
 Processed_Files/

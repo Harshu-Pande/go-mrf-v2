@@ -5,6 +5,7 @@ import (
 	"compress/gzip"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -278,11 +279,22 @@ func writeProviderGroups(group ProviderGroup, providerGroupID int, outputDir str
 		}
 	}
 
+	// Get TIN values with safe defaults
+	tinType := "unknown"
+	if group.TIN.Type != nil {
+		tinType = *group.TIN.Type
+	}
+
+	tinValue := "unknown"
+	if group.TIN.Value != nil {
+		tinValue = *group.TIN.Value
+	}
+
 	record := fmt.Sprintf("%d,%s,%s,%s\n",
 		providerGroupID,
 		npiStr,
-		group.TIN.Type,
-		group.TIN.Value)
+		tinType,
+		tinValue)
 
 	if _, err := writer.Write([]byte(record)); err != nil {
 		return fmt.Errorf("failed to write provider group: %v", err)
@@ -292,24 +304,171 @@ func writeProviderGroups(group ProviderGroup, providerGroupID int, outputDir str
 }
 
 func streamProviderReferences(decoder *json.Decoder, outputDir string, writerPool *FileWriterPool) error {
+	filename := filepath.Join(outputDir, "provider_groups.csv")
+	writer, err := writerPool.getOrCreateWriter(filename)
+	if err != nil {
+		return fmt.Errorf("failed to create provider groups file: %v", err)
+	}
+
+	// Write header if file is empty
+	info, err := writer.file.Stat()
+	if err != nil {
+		return fmt.Errorf("failed to stat file: %v", err)
+	}
+
+	if info.Size() == 0 {
+		header := "provider_group_id,npi,tin_type,tin_value\n"
+		if _, err := writer.Write([]byte(header)); err != nil {
+			return fmt.Errorf("failed to write header: %v", err)
+		}
+	}
+
+	// Read opening bracket
+	t, err := decoder.Token()
+	if err != nil {
+		if err == io.EOF {
+			return nil // Empty array is valid
+		}
+		return fmt.Errorf("failed to read array start: %v", err)
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '[' {
+		return fmt.Errorf("expected array start, got %v", t)
+	}
+
+	fmt.Printf("Processing provider references...\n")
+	var count int64
+	var skippedNPIs int64
+	var malformedTINs int64
+	var skippedRefs int64
+
 	// Process provider references array
 	for decoder.More() {
 		var ref ProviderReference
 		if err := decoder.Decode(&ref); err != nil {
-			return fmt.Errorf("failed to decode provider reference: %v", err)
+			fmt.Printf("WARNING: Failed to decode provider reference: %v\n", err)
+			skippedRefs++
+			// Try to skip the malformed object by reading until next valid token
+			depth := 0
+			for {
+				t, err := decoder.Token()
+				if err != nil {
+					if err == io.EOF {
+						return fmt.Errorf("unexpected EOF while skipping malformed object")
+					}
+					return fmt.Errorf("error while skipping malformed object: %v", err)
+				}
+				if delim, ok := t.(json.Delim); ok {
+					switch delim {
+					case '{', '[':
+						depth++
+					case '}', ']':
+						depth--
+						if depth < 0 {
+							break
+						}
+					}
+				}
+				if depth <= 0 {
+					break
+				}
+			}
+			continue
+		}
+
+		// Use default provider group ID if missing
+		if ref.ProviderGroupID == nil {
+			defaultID := 0
+			ref.ProviderGroupID = &defaultID
+			fmt.Printf("INFO: Using default provider group ID (0) for reference\n")
+		}
+
+		if len(ref.ProviderGroups) == 0 {
+			// Create a default provider group
+			defaultGroup := ProviderGroup{
+				NPI: "",
+				TIN: struct {
+					Type  *string `json:"type,omitempty"`
+					Value *string `json:"value,omitempty"`
+				}{
+					Type:  new(string),
+					Value: new(string),
+				},
+			}
+			ref.ProviderGroups = []ProviderGroup{defaultGroup}
+			fmt.Printf("INFO: Created default provider group for ID %d\n", *ref.ProviderGroupID)
 		}
 
 		for _, group := range ref.ProviderGroups {
-			if err := writeProviderGroups(group, ref.ProviderGroupID, outputDir, writerPool); err != nil {
-				return err
+			// Handle NPI with more formats
+			var npiStr string
+			switch npi := group.NPI.(type) {
+			case string:
+				npiStr = npi
+			case float64:
+				npiStr = fmt.Sprintf("%d", int(npi))
+			case int:
+				npiStr = fmt.Sprintf("%d", npi)
+			case []interface{}:
+				if len(npi) > 0 {
+					switch v := npi[0].(type) {
+					case string:
+						npiStr = v
+					case float64:
+						npiStr = fmt.Sprintf("%d", int(v))
+					case int:
+						npiStr = fmt.Sprintf("%d", v)
+					default:
+						npiStr = fmt.Sprintf("%v", v)
+					}
+				}
+			case nil:
+				npiStr = ""
+			default:
+				npiStr = fmt.Sprintf("%v", npi)
+			}
+
+			// Initialize TIN fields if nil
+			if group.TIN.Type == nil {
+				empty := ""
+				group.TIN.Type = &empty
+			}
+			if group.TIN.Value == nil {
+				empty := ""
+				group.TIN.Value = &empty
+			}
+
+			record := fmt.Sprintf("%d,%s,%s,%s\n",
+				*ref.ProviderGroupID,
+				npiStr,
+				*group.TIN.Type,
+				*group.TIN.Value)
+
+			if _, err := writer.Write([]byte(record)); err != nil {
+				return fmt.Errorf("failed to write provider group: %v", err)
+			}
+		}
+
+		count++
+		if count%1000 == 0 {
+			fmt.Printf("Processed %d provider references (Skipped NPIs: %d, Malformed TINs: %d, Skipped Refs: %d)...\n",
+				count, atomic.LoadInt64(&skippedNPIs), atomic.LoadInt64(&malformedTINs), atomic.LoadInt64(&skippedRefs))
+			// Force flush every 1000 records
+			if err := writer.Flush(); err != nil {
+				return fmt.Errorf("failed to flush writer: %v", err)
 			}
 		}
 	}
 
-	// Consume the array end token
-	if _, err := decoder.Token(); err != nil {
-		return fmt.Errorf("failed to read array end token: %v", err)
+	// Final flush
+	if err := writer.Flush(); err != nil {
+		return fmt.Errorf("failed to flush writer: %v", err)
 	}
+
+	fmt.Printf("Completed processing %d provider references\n"+
+		"Total skipped NPIs: %d\n"+
+		"Total malformed TINs: %d\n"+
+		"Total skipped references: %d\n",
+		count, atomic.LoadInt64(&skippedNPIs), atomic.LoadInt64(&malformedTINs), atomic.LoadInt64(&skippedRefs))
 	return nil
 }
 
@@ -341,44 +500,133 @@ func writeNegotiatedRates(item InNetworkItem, rate NegotiatedRate, price Negotia
 func processInNetworkItem(item InNetworkItem, outputDir string, writerPool *FileWriterPool, itemCount *int64) error {
 	count := atomic.AddInt64(itemCount, 1)
 
-	// Always print the item being processed
-	fmt.Printf("Processing in-network item %d: %s\n", count, item.BillingCode)
+	// Even if billing code is nil, try to generate a placeholder
+	billingCode := "UNKNOWN_CODE"
+	if item.BillingCode != nil {
+		billingCode = *item.BillingCode
+	}
 
-	// Pre-allocate buffer for all records
-	var builder strings.Builder
-	builder.Grow(1024 * 8) // Pre-allocate 8KB
+	// Use empty string for missing modifiers
+	billingCodeType := ""
+	if item.BillingCodeType != nil {
+		billingCodeType = *item.BillingCodeType
+	}
 
-	// Build all records in memory first
+	billingCodeVersion := ""
+	if item.BillingCodeTypeVersion != nil {
+		billingCodeVersion = *item.BillingCodeTypeVersion
+	}
+
+	// Log all items for debugging
+	if count%1000 == 0 {
+		fmt.Printf("Processing item %d - Code: %s, Type: %s, Version: %s\n",
+			count, billingCode, billingCodeType, billingCodeVersion)
+	}
+
+	// Don't skip empty negotiated rates, just log
+	if len(item.NegotiatedRates) == 0 {
+		fmt.Printf("INFO: No negotiated rates found for billing code %s (item %d) - creating empty record\n", billingCode, count)
+		// Create a single empty record to preserve the billing code
+		record := fmt.Sprintf("0,0.0,%s,%s,%s,%s,%s\n",
+			billingCode,
+			billingCodeType,
+			"", // empty negotiation arrangement
+			"", // empty negotiated type
+			"") // empty billing class
+		filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", billingCode))
+		return writerPool.WriteAsync(filename, []byte(record))
+	}
+
+	var validRecords []string
+
 	for _, rate := range item.NegotiatedRates {
+		// If no provider references, use a default
+		if len(rate.ProviderReferences) == 0 {
+			rate.ProviderReferences = []int{0} // Use 0 as default provider reference
+			fmt.Printf("INFO: Using default provider reference for billing code %s (item %d)\n", billingCode, count)
+		}
+
+		// If no negotiated prices, create one with zero value
+		if len(rate.NegotiatedPrices) == 0 {
+			fmt.Printf("INFO: Creating default price for billing code %s (item %d)\n", billingCode, count)
+			defaultPrice := NegotiatedPrice{
+				NegotiatedRate: new(float64), // Will be 0.0 by default
+			}
+			rate.NegotiatedPrices = []NegotiatedPrice{defaultPrice}
+		}
+
 		for _, price := range rate.NegotiatedPrices {
+			// Use 0.0 as default price if nil
+			negotiatedRate := 0.0
+			if price.NegotiatedRate != nil {
+				// Accept any price, even negative ones
+				negotiatedRate = *price.NegotiatedRate
+			}
+
+			// Use empty strings for all missing optional fields
+			negotiatedType := ""
+			if price.NegotiatedType != nil {
+				negotiatedType = *price.NegotiatedType
+			}
+
+			billingClass := ""
+			if price.BillingClass != nil {
+				billingClass = *price.BillingClass
+			}
+
+			negotiationArrangement := ""
+			if item.NegotiationArrangement != nil {
+				negotiationArrangement = *item.NegotiationArrangement
+			}
+
 			for _, providerRef := range rate.ProviderReferences {
-				fmt.Fprintf(&builder, "%d,%f,%s,%s,%s,%s,%s\n",
+				record := fmt.Sprintf("%d,%f,%s,%s,%s,%s,%s\n",
 					providerRef,
-					price.NegotiatedRate,
-					item.BillingCode,
-					item.BillingCodeType,
-					item.NegotiationArrangement,
-					price.NegotiatedType,
-					price.BillingClass)
+					negotiatedRate,
+					billingCode,
+					billingCodeType,
+					negotiationArrangement,
+					negotiatedType,
+					billingClass)
+				validRecords = append(validRecords, record)
 			}
 		}
 	}
 
-	// Write all records at once if we have any
-	if builder.Len() > 0 {
-		filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", item.BillingCode))
-		return writerPool.WriteAsync(filename, []byte(builder.String()))
+	// Always write records, even if some fields are empty
+	if len(validRecords) > 0 {
+		filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", billingCode))
+		return writerPool.WriteAsync(filename, []byte(strings.Join(validRecords, "")))
 	}
 
 	return nil
 }
 
 func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *FileWriterPool) error {
+	// Create in_network directory
+	inNetworkDir := filepath.Join(outputDir, "in_network")
+	if err := os.MkdirAll(inNetworkDir, 0755); err != nil {
+		return fmt.Errorf("failed to create in_network directory: %v", err)
+	}
+
+	// Read opening bracket
+	t, err := decoder.Token()
+	if err != nil {
+		if err == io.EOF {
+			return nil // Empty array is valid
+		}
+		return fmt.Errorf("failed to read array start: %v", err)
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '[' {
+		return fmt.Errorf("expected array start, got %v", t)
+	}
+
 	// Create a buffered channel for items
 	itemChan := make(chan InNetworkItem, processorConfig.NumWorkers*2)
-	errChan := make(chan error, 1)
+	errChan := make(chan error, processorConfig.NumWorkers)
 	var wg sync.WaitGroup
 	var itemCount int64
+	var errorCount int64
 
 	// Start worker goroutines
 	fmt.Printf("Starting %d workers for parallel processing...\n", processorConfig.NumWorkers)
@@ -390,11 +638,12 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 			defer wg.Done()
 			for item := range itemChan {
 				if err := processInNetworkItem(item, outputDir, writerPool, &itemCount); err != nil {
+					atomic.AddInt64(&errorCount, 1)
 					select {
 					case errChan <- err:
 					default:
+						fmt.Printf("WARNING: Error channel full, dropping error: %v\n", err)
 					}
-					return
 				}
 			}
 		}()
@@ -403,99 +652,151 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 	// Process items and track performance
 	startTime := time.Now()
 	lastUpdateTime := startTime
+	var decodeErrors int64
 
 	go func() {
 		defer close(itemChan)
 		for decoder.More() {
 			var item InNetworkItem
 			if err := decoder.Decode(&item); err != nil {
-				select {
-				case errChan <- fmt.Errorf("failed to decode in-network item: %v", err):
-				default:
+				atomic.AddInt64(&decodeErrors, 1)
+				fmt.Printf("WARNING: Failed to decode in-network item: %v\n", err)
+
+				// Try to skip the malformed object
+				depth := 0
+				for {
+					t, err := decoder.Token()
+					if err != nil {
+						if err == io.EOF {
+							fmt.Printf("WARNING: Unexpected EOF while skipping malformed object\n")
+							return
+						}
+						fmt.Printf("WARNING: Error while skipping malformed object: %v\n", err)
+						return
+					}
+					if delim, ok := t.(json.Delim); ok {
+						switch delim {
+						case '{', '[':
+							depth++
+						case '}', ']':
+							depth--
+							if depth < 0 {
+								break
+							}
+						}
+					}
+					if depth <= 0 {
+						break
+					}
 				}
-				return
+				continue
 			}
-			itemChan <- item
+
+			select {
+			case itemChan <- item:
+			case err := <-errChan:
+				fmt.Printf("ERROR: Worker reported error: %v\n", err)
+			}
 
 			// Update performance stats every 5 seconds
 			now := time.Now()
 			if now.Sub(lastUpdateTime) >= 5*time.Second {
 				current := atomic.LoadInt64(&itemCount)
+				errors := atomic.LoadInt64(&errorCount)
+				decodeErrs := atomic.LoadInt64(&decodeErrors)
 				elapsed := now.Sub(startTime).Seconds()
 				itemsPerSec := float64(current) / elapsed
-				fmt.Printf("\n--- Performance: %.1f items/sec (processed %d items in %.1f seconds) ---\n\n",
-					itemsPerSec, current, elapsed)
+				fmt.Printf("\n--- Performance: %.1f items/sec (processed %d items, %d errors, %d decode errors in %.1f seconds) ---\n\n",
+					itemsPerSec, current, errors, decodeErrs, elapsed)
 				os.Stdout.Sync()
 				lastUpdateTime = now
 			}
+		}
+
+		// Read closing bracket
+		t, err := decoder.Token()
+		if err != nil {
+			if err != io.EOF {
+				fmt.Printf("WARNING: Failed to read array end: %v\n", err)
+			}
+			return
+		}
+		if delim, ok := t.(json.Delim); !ok || delim != ']' {
+			fmt.Printf("WARNING: Expected array end, got %v\n", t)
+			return
 		}
 	}()
 
 	// Wait for all workers to finish
 	wg.Wait()
 
+	// Check for any remaining errors
+	close(errChan)
+	var lastErr error
+	for err := range errChan {
+		lastErr = err
+		fmt.Printf("ERROR: %v\n", err)
+	}
+
 	// Final statistics
 	totalTime := time.Since(startTime)
 	totalCount := atomic.LoadInt64(&itemCount)
+	totalErrors := atomic.LoadInt64(&errorCount)
+	totalDecodeErrors := atomic.LoadInt64(&decodeErrors)
 	itemsPerSec := float64(totalCount) / totalTime.Seconds()
 
-	fmt.Printf("\nCompleted processing %d items in %.1f seconds (%.1f items/sec)\n",
-		totalCount, totalTime.Seconds(), itemsPerSec)
+	fmt.Printf("\nProcessing complete:\n"+
+		"- Total items processed: %d\n"+
+		"- Processing errors: %d\n"+
+		"- Decode errors: %d\n"+
+		"- Time taken: %.1f seconds\n"+
+		"- Average speed: %.1f items/sec\n",
+		totalCount, totalErrors, totalDecodeErrors, totalTime.Seconds(), itemsPerSec)
 	os.Stdout.Sync()
 
-	// Check for errors
-	select {
-	case err := <-errChan:
-		return err
-	default:
+	if lastErr != nil {
+		return fmt.Errorf("completed with errors: %v", lastErr)
 	}
 
 	return nil
 }
 
+// ProcessFile processes the input file and writes results to the output directory
 func ProcessFile(inputFile, outputDir string, r2Config *R2Config, remotePrefix string) error {
-	fmt.Printf("Starting processing with %d CPU cores...\n", runtime.NumCPU())
+	fmt.Printf("Opening input file: %s\n", inputFile)
 
-	// Create output directory if it doesn't exist
-	if err := os.MkdirAll(outputDir, 0755); err != nil {
-		return fmt.Errorf("failed to create output directory: %v", err)
-	}
-
-	// Initialize the writer pool with R2 config
-	writerPool := NewFileWriterPool(runtime.NumCPU())
-	writerPool.r2Config = r2Config
-	writerPool.remotePrefix = remotePrefix
-	defer writerPool.Close()
-
-	// Create CSV files with headers
-	headers := map[string]string{
-		"provider_groups.csv":  "provider_group_id,npi,tin_type,tin_value\n",
-		"negotiated_rates.csv": "provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class\n",
-	}
-
-	for filename, header := range headers {
-		if err := writerPool.WriteAsync(filepath.Join(outputDir, filename), []byte(header)); err != nil {
-			return fmt.Errorf("failed to write header to %s: %v", filename, err)
-		}
-	}
-
-	// Open and decompress the file
 	file, err := os.Open(inputFile)
 	if err != nil {
-		return fmt.Errorf("failed to open file: %v", err)
+		return fmt.Errorf("failed to open input file: %v", err)
 	}
 	defer file.Close()
 
+	fmt.Printf("Creating gzip reader\n")
 	gzReader, err := gzip.NewReader(file)
 	if err != nil {
 		return fmt.Errorf("failed to create gzip reader: %v", err)
 	}
 	defer gzReader.Close()
 
-	// Create a JSON decoder that reads from the gzip reader
+	fmt.Printf("Creating JSON decoder\n")
 	decoder := json.NewDecoder(gzReader)
 
+	// Enable number parsing
+	decoder.UseNumber()
+
+	// Create writer pool
+	fmt.Printf("Creating writer pool\n")
+	writerPool := NewFileWriterPool(maxOpenFiles)
+	defer writerPool.Close()
+
+	// Configure R2 if needed
+	if r2Config != nil {
+		writerPool.r2Config = r2Config
+		writerPool.remotePrefix = remotePrefix
+	}
+
 	// Read opening brace
+	fmt.Printf("Reading initial JSON token\n")
 	t, err := decoder.Token()
 	if err != nil {
 		return fmt.Errorf("failed to read opening brace: %v", err)
@@ -504,54 +805,81 @@ func ProcessFile(inputFile, outputDir string, r2Config *R2Config, remotePrefix s
 		return fmt.Errorf("expected opening brace, got %v", t)
 	}
 
-	// Process the JSON stream
+	// Process file contents
+	inNetworkFound := false
+	sectionsFound := make(map[string]bool)
+
+	fmt.Printf("\nStarting to read JSON structure:\n")
 	for decoder.More() {
 		t, err := decoder.Token()
 		if err != nil {
 			return fmt.Errorf("failed to read token: %v", err)
 		}
 
-		// Process each top-level field
 		key, ok := t.(string)
 		if !ok {
+			fmt.Printf("WARNING: Non-string key found: %v\n", t)
 			continue
 		}
 
+		sectionsFound[key] = true
+		fmt.Printf("Found section: %s\n", key)
+
 		switch key {
 		case "provider_references":
-			// Start of provider_references array
-			t, err := decoder.Token()
-			if err != nil {
-				return fmt.Errorf("failed to read provider_references array start: %v", err)
-			}
-			if delim, ok := t.(json.Delim); !ok || delim != '[' {
-				return fmt.Errorf("expected array start, got %v", t)
-			}
+			fmt.Printf("Starting provider_references section...\n")
 			if err := streamProviderReferences(decoder, outputDir, writerPool); err != nil {
 				return fmt.Errorf("failed to process provider references: %v", err)
 			}
-
 		case "in_network":
-			// Start of in_network array
-			t, err := decoder.Token()
-			if err != nil {
-				return fmt.Errorf("failed to read in_network array start: %v", err)
-			}
-			if delim, ok := t.(json.Delim); !ok || delim != '[' {
-				return fmt.Errorf("expected array start, got %v", t)
-			}
+			inNetworkFound = true
+			fmt.Printf("Found in_network section, starting processing...\n")
 			if err := streamInNetworkItems(decoder, outputDir, writerPool); err != nil {
 				return fmt.Errorf("failed to process in-network items: %v", err)
 			}
-
+			fmt.Printf("Completed processing in_network section\n")
 		default:
-			// Skip other fields
-			if _, err := decoder.Token(); err != nil {
-				return fmt.Errorf("failed to skip value: %v", err)
+			fmt.Printf("Skipping section: %s\n", key)
+			// Try to determine the type of the section
+			t, err := decoder.Token()
+			if err != nil {
+				return fmt.Errorf("failed to read value type for section %s: %v", key, err)
+			}
+			if delim, ok := t.(json.Delim); ok {
+				fmt.Printf("Section %s is a %v\n", key, delim)
+				// Skip the section
+				depth := 1
+				for depth > 0 {
+					t, err := decoder.Token()
+					if err != nil {
+						return fmt.Errorf("failed to skip section %s: %v", key, err)
+					}
+					if delim, ok := t.(json.Delim); ok {
+						switch delim {
+						case '{', '[':
+							depth++
+						case '}', ']':
+							depth--
+						}
+					}
+				}
+			} else {
+				fmt.Printf("Section %s has value: %v\n", key, t)
 			}
 		}
 	}
 
+	fmt.Printf("\nJSON Structure Summary:\n")
+	fmt.Printf("Sections found in file:\n")
+	for section := range sectionsFound {
+		fmt.Printf("- %s\n", section)
+	}
+
+	if !inNetworkFound {
+		fmt.Printf("\nWARNING: No in_network section found in the file\n")
+	}
+
+	fmt.Printf("\nProcessing complete\n")
 	return nil
 }
 

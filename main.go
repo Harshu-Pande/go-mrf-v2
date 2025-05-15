@@ -6,8 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
-
-	"golang.org/x/sys/unix"
 )
 
 func printUsage() {
@@ -64,6 +62,9 @@ func main() {
 	inputFile := args[0]
 	outputDir := args[1]
 
+	fmt.Printf("Input file: %s\nOutput directory: %s\nWorkers: %d\nBuffer size: %dMB\n",
+		inputFile, outputDir, *numWorkers, *bufferSize)
+
 	// Validate input file
 	if _, err := os.Stat(inputFile); os.IsNotExist(err) {
 		fmt.Printf("Error: Input file '%s' does not exist\n", inputFile)
@@ -97,17 +98,10 @@ func main() {
 	// Set GOMAXPROCS to use specified number of workers
 	runtime.GOMAXPROCS(*numWorkers)
 
-	// Increase resource limits
-	var rLimit unix.Rlimit
-	if err := unix.Getrlimit(unix.RLIMIT_NOFILE, &rLimit); err == nil {
-		rLimit.Cur = rLimit.Max
-		unix.Setrlimit(unix.RLIMIT_NOFILE, &rLimit)
-	}
-
 	// Process the file
-	fmt.Printf("Processing %s with %d workers...\n", filepath.Base(inputFile), *numWorkers)
+	fmt.Printf("Starting processing of %s with %d workers...\n", filepath.Base(inputFile), *numWorkers)
 	if err := ProcessFile(inputFile, outputDir, r2Config, *r2Prefix); err != nil {
-		fmt.Printf("Error: %v\n", err)
+		fmt.Printf("Error during processing: %v\n", err)
 		os.Exit(1)
 	}
 
