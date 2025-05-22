@@ -3,8 +3,13 @@ package main
 import (
 	"bufio"
 	"compress/gzip"
+	"context"
+	"encoding/csv"
 	"encoding/json"
 	"fmt"
+	"io"
+	"log"
+	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -260,57 +265,365 @@ func writeProviderGroups(group ProviderGroup, providerGroupID int, outputDir str
 		return fmt.Errorf("failed to get writer for provider groups: %v", err)
 	}
 
-	// Handle different NPI types
-	var npiStr string
-	switch npi := group.NPI.(type) {
-	case string:
-		npiStr = npi
-	case float64:
-		npiStr = fmt.Sprintf("%d", int(npi))
-	case []interface{}:
-		// Take the first NPI if it's an array
-		if len(npi) > 0 {
-			if str, ok := npi[0].(string); ok {
-				npiStr = str
-			} else if num, ok := npi[0].(float64); ok {
-				npiStr = fmt.Sprintf("%d", int(num))
-			}
+	// Write a record for each NPI
+	for _, npi := range group.GetNPIStrings() {
+		// Clean and validate NPI
+		npi = strings.TrimSpace(npi)
+		if npi == "" {
+			continue
 		}
-	}
 
-	record := fmt.Sprintf("%d,%s,%s,%s\n",
-		providerGroupID,
-		npiStr,
-		group.TIN.Type,
-		group.TIN.Value)
+		record := fmt.Sprintf("%d,%s,%s,%s\n",
+			providerGroupID,
+			npi,
+			group.TIN.Type,
+			group.TIN.Value)
 
-	if _, err := writer.Write([]byte(record)); err != nil {
-		return fmt.Errorf("failed to write provider group: %v", err)
+		if _, err := writer.Write([]byte(record)); err != nil {
+			return fmt.Errorf("failed to write provider group: %v", err)
+		}
 	}
 
 	return nil
 }
 
-func streamProviderReferences(decoder *json.Decoder, outputDir string, writerPool *FileWriterPool) error {
+// RemoteReferenceResult represents the result of fetching a remote reference
+type RemoteReferenceResult struct {
+	Reference *ProviderReference
+	Error     error
+	Retries   int
+}
+
+// RateLimiter provides simple rate limiting functionality
+type RateLimiter struct {
+	ticker *time.Ticker
+	done   chan bool
+}
+
+func NewRateLimiter(requestsPerSecond int) *RateLimiter {
+	return &RateLimiter{
+		ticker: time.NewTicker(time.Second / time.Duration(requestsPerSecond)),
+		done:   make(chan bool),
+	}
+}
+
+func (r *RateLimiter) Wait() {
+	select {
+	case <-r.ticker.C:
+		return
+	case <-r.done:
+		return
+	}
+}
+
+func (r *RateLimiter) Stop() {
+	r.ticker.Stop()
+	close(r.done)
+}
+
+// fetchRemoteReference fetches and decodes a remote provider reference with retries
+func fetchRemoteReference(client *http.Client, ref RemoteReference, rateLimiter *RateLimiter) (*ProviderReference, error) {
+	maxRetries := 3
+	backoff := 1 * time.Second
+
+	var lastErr error
+	for retry := 0; retry < maxRetries; retry++ {
+		if retry > 0 {
+			time.Sleep(backoff)
+			backoff *= 2 // Exponential backoff
+		}
+
+		if rateLimiter != nil {
+			rateLimiter.Wait()
+		}
+
+		resp, err := client.Get(ref.URL)
+		if err != nil {
+			lastErr = fmt.Errorf("attempt %d: failed to fetch remote reference: %v", retry+1, err)
+			continue
+		}
+
+		// Check for rate limiting or server errors that should trigger retry
+		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
+			resp.Body.Close()
+			lastErr = fmt.Errorf("attempt %d: server returned status %d", retry+1, resp.StatusCode)
+			continue
+		}
+
+		if resp.StatusCode != http.StatusOK {
+			resp.Body.Close()
+			return nil, fmt.Errorf("remote reference returned status %d", resp.StatusCode)
+		}
+
+		var remoteRef ProviderReference
+		err = json.NewDecoder(resp.Body).Decode(&remoteRef)
+		resp.Body.Close()
+		if err != nil {
+			lastErr = fmt.Errorf("attempt %d: failed to decode remote reference: %v", retry+1, err)
+			continue
+		}
+
+		remoteRef.ProviderGroupID = ref.ProviderGroupID
+		return &remoteRef, nil
+	}
+
+	return nil, fmt.Errorf("failed after %d retries: %v", maxRetries, lastErr)
+}
+
+// processRemoteReferences processes remote references in parallel with improved error handling
+func processRemoteReferences(refs []RemoteReference) (map[int][]ProviderGroup, error) {
+	if len(refs) == 0 {
+		return make(map[int][]ProviderGroup), nil
+	}
+
+	// Create result map and mutex for concurrent access
+	resultMap := make(map[int][]ProviderGroup)
+	var resultMutex sync.Mutex
+
+	// Create error tracking
+	var errorCount int32
+	var firstError atomic.Value
+
+	// Create work channel and result channel
+	workChan := make(chan RemoteReference, len(refs))
+	resultChan := make(chan RemoteReferenceResult, len(refs))
+
+	// Create rate limiter (100 requests per second)
+	rateLimiter := NewRateLimiter(100)
+	defer rateLimiter.Stop()
+
+	// Create HTTP client with improved configuration
+	client := &http.Client{
+		Timeout: 30 * time.Second,
+		Transport: &http.Transport{
+			MaxIdleConns:        100,
+			MaxIdleConnsPerHost: 100,
+			IdleConnTimeout:     90 * time.Second,
+			DisableKeepAlives:   false,
+			DisableCompression:  false,
+			ForceAttemptHTTP2:   true,
+		},
+	}
+
+	// Start worker goroutines
+	var wg sync.WaitGroup
+	numWorkers := min(200, len(refs))
+
+	// Create context with timeout for overall processing
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
+	defer cancel()
+
+	for i := 0; i < numWorkers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for {
+				select {
+				case ref, ok := <-workChan:
+					if !ok {
+						return
+					}
+					remoteRef, err := fetchRemoteReference(client, ref, rateLimiter)
+					result := RemoteReferenceResult{Reference: remoteRef, Error: err}
+
+					select {
+					case resultChan <- result:
+					case <-ctx.Done():
+						return
+					}
+
+					if err != nil {
+						if atomic.AddInt32(&errorCount, 1) == 1 {
+							firstError.Store(err)
+						}
+					}
+				case <-ctx.Done():
+					return
+				}
+			}
+		}()
+	}
+
+	// Send work to workers
+	go func() {
+		for _, ref := range refs {
+			select {
+			case workChan <- ref:
+			case <-ctx.Done():
+				return
+			}
+		}
+		close(workChan)
+	}()
+
+	// Process results
+	go func() {
+		wg.Wait()
+		close(resultChan)
+	}()
+
+	// Collect results
+	for result := range resultChan {
+		if result.Error != nil {
+			continue // Skip failed references but continue processing
+		}
+
+		ref := result.Reference
+		resultMutex.Lock()
+		resultMap[ref.ProviderGroupID] = ref.ProviderGroups
+		resultMutex.Unlock()
+	}
+
+	// Check context for timeout
+	if ctx.Err() != nil {
+		return nil, fmt.Errorf("remote reference processing timed out after 10 minutes")
+	}
+
+	// If we had errors but got some results, log warning and continue
+	if errorCount > 0 {
+		firstErr := firstError.Load().(error)
+		log.Printf("Warning: %d remote references failed to process. First error: %v", errorCount, firstErr)
+	}
+
+	return resultMap, nil
+}
+
+// Helper function to convert NPI to string, handling different types
+func npiToString(npi interface{}) string {
+	switch v := npi.(type) {
+	case string:
+		return v
+	case float64:
+		return fmt.Sprintf("%.0f", v)
+	case int:
+		return fmt.Sprintf("%d", v)
+	case int64:
+		return fmt.Sprintf("%d", v)
+	case json.Number:
+		return v.String()
+	default:
+		return fmt.Sprintf("%v", v)
+	}
+}
+
+// Modify streamProviderReferences to handle extraction and CSV conversion
+func streamProviderReferences(decoder *json.Decoder, outputDir string, writerPool *FileWriterPool) (map[int][]ProviderGroup, error) {
+	var providerRefs []ProviderReference
+	referenceMap := make(map[int][]ProviderGroup)
+
+	// Create the provider_references directory if it doesn't exist
+	refsDir := filepath.Join(outputDir, "provider_references")
+	if err := os.MkdirAll(refsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create provider_references directory: %v", err)
+	}
+
+	// Create JSON output file for provider references
+	jsonOutputPath := filepath.Join(refsDir, "provider_references.json")
+	jsonFile, err := os.Create(jsonOutputPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create JSON output file: %v", err)
+	}
+	defer jsonFile.Close()
+
+	// Create JSON encoder for pretty output
+	encoder := json.NewEncoder(jsonFile)
+	encoder.SetIndent("", "  ")
+
 	// Process provider references array
 	for decoder.More() {
 		var ref ProviderReference
 		if err := decoder.Decode(&ref); err != nil {
-			return fmt.Errorf("failed to decode provider reference: %v", err)
+			return nil, fmt.Errorf("failed to decode provider reference: %v", err)
 		}
 
+		// Store in memory for both JSON and CSV output
+		providerRefs = append(providerRefs, ref)
+
+		// Add to reference map
+		referenceMap[ref.ProviderGroupID] = ref.ProviderGroups
+	}
+
+	// Write all provider references to JSON file
+	if err := encoder.Encode(providerRefs); err != nil {
+		return nil, fmt.Errorf("failed to write provider references JSON: %v", err)
+	}
+
+	// Create CSV file for provider groups
+	csvFile, err := os.Create(filepath.Join(refsDir, "provider_groups.csv"))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create CSV file: %v", err)
+	}
+	defer csvFile.Close()
+
+	// Create CSV writer
+	writer := csv.NewWriter(csvFile)
+	defer writer.Flush()
+
+	// Write CSV header
+	header := []string{"provider_group_id", "npi", "tin_type", "tin_value"}
+	if err := writer.Write(header); err != nil {
+		return nil, fmt.Errorf("failed to write CSV header: %v", err)
+	}
+
+	// Track statistics
+	totalNPIs := 0
+	uniqueNPIs := make(map[string]bool)
+	tinTypes := make(map[string]int)
+	totalProviderGroups := 0
+	rowsWritten := 0
+
+	// Process each provider reference for CSV output
+	for _, ref := range providerRefs {
 		for _, group := range ref.ProviderGroups {
-			if err := writeProviderGroups(group, ref.ProviderGroupID, outputDir, writerPool); err != nil {
-				return err
+			totalProviderGroups++
+			tinTypes[group.TIN.Type]++
+
+			for _, npi := range group.NPI {
+				npiStr := npiToString(npi)
+				if npiStr != "" && npiStr != "null" && npiStr != "<nil>" {
+					totalNPIs++
+					uniqueNPIs[npiStr] = true
+
+					// Write row to CSV
+					row := []string{
+						fmt.Sprintf("%d", ref.ProviderGroupID),
+						npiStr,
+						group.TIN.Type,
+						group.TIN.Value,
+					}
+					if err := writer.Write(row); err != nil {
+						return nil, fmt.Errorf("failed to write CSV row: %v", err)
+					}
+					rowsWritten++
+				}
 			}
 		}
 	}
 
+	// Print statistics
+	fmt.Printf("\nProvider Reference Processing Stats:\n")
+	fmt.Printf("Total provider references: %d\n", len(providerRefs))
+	fmt.Printf("Total provider groups: %d\n", totalProviderGroups)
+	fmt.Printf("Average groups per reference: %.2f\n", float64(totalProviderGroups)/float64(len(providerRefs)))
+	fmt.Printf("\nNPI Stats:\n")
+	fmt.Printf("Total NPIs (with duplicates): %d\n", totalNPIs)
+	fmt.Printf("Unique NPIs: %d\n", len(uniqueNPIs))
+	fmt.Printf("Average NPIs per group: %.2f\n", float64(totalNPIs)/float64(totalProviderGroups))
+	fmt.Printf("\nTIN Type Distribution:\n")
+	for tinType, count := range tinTypes {
+		fmt.Printf("%s: %d (%.2f%%)\n", tinType, count, float64(count)/float64(totalProviderGroups)*100)
+	}
+	fmt.Printf("\nOutput files:\n")
+	fmt.Printf("- JSON: %s\n", jsonOutputPath)
+	fmt.Printf("- CSV: %s\n", csvFile.Name())
+	fmt.Printf("Total rows written to CSV: %d\n\n", rowsWritten)
+
 	// Consume the array end token
 	if _, err := decoder.Token(); err != nil {
-		return fmt.Errorf("failed to read array end token: %v", err)
+		return nil, fmt.Errorf("failed to read array end token: %v", err)
 	}
-	return nil
+
+	return referenceMap, nil
 }
 
 func writeNegotiatedRates(item InNetworkItem, rate NegotiatedRate, price NegotiatedPrice, providerRef int, outputDir string, writerPool *FileWriterPool) error {
@@ -321,14 +634,16 @@ func writeNegotiatedRates(item InNetworkItem, rate NegotiatedRate, price Negotia
 		return fmt.Errorf("failed to get writer for billing code %s: %v", item.BillingCode, err)
 	}
 
-	record := fmt.Sprintf("%d,%f,%s,%s,%s,%s,%s\n",
+	modifiers := strings.Join(price.BillingCodeModifier, "|")
+	record := fmt.Sprintf("%d,%f,%s,%s,%s,%s,%s,%s\n",
 		providerRef,
 		price.NegotiatedRate,
 		item.BillingCode,
 		item.BillingCodeType,
 		item.NegotiationArrangement,
 		price.NegotiatedType,
-		price.BillingClass)
+		price.BillingClass,
+		modifiers)
 
 	if _, err := writer.Write([]byte(record)); err != nil {
 		return fmt.Errorf("failed to write negotiated rate: %v", err)
@@ -340,19 +655,24 @@ func writeNegotiatedRates(item InNetworkItem, rate NegotiatedRate, price Negotia
 // Worker function to process in-network items
 func processInNetworkItem(item InNetworkItem, outputDir string, writerPool *FileWriterPool, itemCount *int64) error {
 	count := atomic.AddInt64(itemCount, 1)
+	if count%1000 == 0 {
+		fmt.Printf("Processing in-network item %d: %s\n", count, item.BillingCode)
+	}
 
-	// Always print the item being processed
-	fmt.Printf("Processing in-network item %d: %s\n", count, item.BillingCode)
+	// Create filename based on billing code
+	filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", item.BillingCode))
 
 	// Pre-allocate buffer for all records
 	var builder strings.Builder
 	builder.Grow(1024 * 8) // Pre-allocate 8KB
 
-	// Build all records in memory first
+	// Process each negotiated rate
 	for _, rate := range item.NegotiatedRates {
 		for _, price := range rate.NegotiatedPrices {
+			// Process each provider reference
 			for _, providerRef := range rate.ProviderReferences {
-				fmt.Fprintf(&builder, "%d,%f,%s,%s,%s,%s,%s\n",
+				// Build the CSV record
+				record := fmt.Sprintf("%d,%f,%s,%s,%s,%s,%s\n",
 					providerRef,
 					price.NegotiatedRate,
 					item.BillingCode,
@@ -360,21 +680,22 @@ func processInNetworkItem(item InNetworkItem, outputDir string, writerPool *File
 					item.NegotiationArrangement,
 					price.NegotiatedType,
 					price.BillingClass)
+
+				builder.WriteString(record)
 			}
 		}
 	}
 
-	// Write all records at once if we have any
+	// Write all records at once
 	if builder.Len() > 0 {
-		filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", item.BillingCode))
 		return writerPool.WriteAsync(filename, []byte(builder.String()))
 	}
 
 	return nil
 }
 
-func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *FileWriterPool) error {
-	// Create a buffered channel for items
+func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *FileWriterPool, referenceMap map[int][]ProviderGroup) error {
+	// Create buffered channels for processing
 	itemChan := make(chan InNetworkItem, processorConfig.NumWorkers*2)
 	errChan := make(chan error, 1)
 	var wg sync.WaitGroup
@@ -382,7 +703,7 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 
 	// Start worker goroutines
 	fmt.Printf("Starting %d workers for parallel processing...\n", processorConfig.NumWorkers)
-	os.Stdout.Sync() // Force flush stdout
+	os.Stdout.Sync()
 
 	for i := 0; i < processorConfig.NumWorkers; i++ {
 		wg.Add(1)
@@ -415,6 +736,7 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 				}
 				return
 			}
+
 			itemChan <- item
 
 			// Update performance stats every 5 seconds
@@ -453,6 +775,72 @@ func streamInNetworkItems(decoder *json.Decoder, outputDir string, writerPool *F
 	return nil
 }
 
+// copyNextObject copies a complete JSON object from the decoder to the writer
+func copyNextObject(decoder *json.Decoder, writer io.Writer) error {
+	// Read the first token which should be '{' for an object
+	t, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '{' {
+		return fmt.Errorf("expected object start, got %v", t)
+	}
+
+	// Write the opening brace
+	if _, err := writer.Write([]byte("{")); err != nil {
+		return err
+	}
+
+	depth := 1
+	first := true
+
+	// Copy tokens until we complete the object
+	for depth > 0 {
+		t, err := decoder.Token()
+		if err != nil {
+			return err
+		}
+
+		if !first {
+			if _, err := writer.Write([]byte(",")); err != nil {
+				return err
+			}
+		}
+		first = false
+
+		switch v := t.(type) {
+		case json.Delim:
+			if v == '{' || v == '[' {
+				depth++
+			} else if v == '}' || v == ']' {
+				depth--
+			}
+			if _, err := writer.Write([]byte(string(v))); err != nil {
+				return err
+			}
+		case string:
+			if _, err := fmt.Fprintf(writer, "%q", v); err != nil {
+				return err
+			}
+		case float64:
+			if _, err := fmt.Fprintf(writer, "%g", v); err != nil {
+				return err
+			}
+		case bool:
+			if _, err := fmt.Fprintf(writer, "%t", v); err != nil {
+				return err
+			}
+		case nil:
+			if _, err := writer.Write([]byte("null")); err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
+// ProcessFile processes a gzipped MRF JSON file
 func ProcessFile(inputFile, outputDir string, r2Config *R2Config, remotePrefix string) error {
 	fmt.Printf("Starting processing with %d CPU cores...\n", runtime.NumCPU())
 
@@ -467,19 +855,137 @@ func ProcessFile(inputFile, outputDir string, r2Config *R2Config, remotePrefix s
 	writerPool.remotePrefix = remotePrefix
 	defer writerPool.Close()
 
-	// Create CSV files with headers
-	headers := map[string]string{
-		"provider_groups.csv":  "provider_group_id,npi,tin_type,tin_value\n",
-		"negotiated_rates.csv": "provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class\n",
+	// First pass: Extract and process provider_references
+	fmt.Printf("First pass: Extracting provider references from %s\n", inputFile)
+	referenceMap, err := extractProviderReferences(inputFile, outputDir)
+	if err != nil {
+		return fmt.Errorf("failed to extract provider references: %v", err)
 	}
 
-	for filename, header := range headers {
-		if err := writerPool.WriteAsync(filepath.Join(outputDir, filename), []byte(header)); err != nil {
-			return fmt.Errorf("failed to write header to %s: %v", filename, err)
+	// Second pass: Stream and process in_network items
+	fmt.Printf("Second pass: Processing in_network items\n")
+	if err := processInNetworkItems(inputFile, outputDir, writerPool, referenceMap); err != nil {
+		return fmt.Errorf("failed to process in-network items: %v", err)
+	}
+
+	return nil
+}
+
+// extractProviderReferences reads just the provider_references section from the file
+func extractProviderReferences(inputFile string, outputDir string) (map[int][]ProviderGroup, error) {
+	file, err := os.Open(inputFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %v", err)
+	}
+	defer file.Close()
+
+	gzReader, err := gzip.NewReader(file)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create gzip reader: %v", err)
+	}
+	defer gzReader.Close()
+
+	// Create a decoder that will decode numbers as json.Number to preserve precision
+	decoder := json.NewDecoder(gzReader)
+	decoder.UseNumber()
+
+	// Create provider_references directory
+	refsDir := filepath.Join(outputDir, "provider_references")
+	if err := os.MkdirAll(refsDir, 0755); err != nil {
+		return nil, fmt.Errorf("failed to create provider_references directory: %v", err)
+	}
+
+	// Read opening brace of the root object
+	t, err := decoder.Token()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read opening brace: %v", err)
+	}
+	if delim, ok := t.(json.Delim); !ok || delim != '{' {
+		return nil, fmt.Errorf("expected opening brace, got %v", t)
+	}
+
+	// Skip metadata fields until we find provider_references
+	for decoder.More() {
+		t, err := decoder.Token()
+		if err != nil {
+			return nil, fmt.Errorf("failed to read token: %v", err)
+		}
+
+		if str, ok := t.(string); ok {
+			if str == "provider_references" {
+				// Found provider_references field, decode it directly
+				var providerRefs []ProviderReference
+				if err := decoder.Decode(&providerRefs); err != nil {
+					return nil, fmt.Errorf("failed to decode provider references: %v", err)
+				}
+
+				// Write to JSON file
+				jsonFile, err := os.Create(filepath.Join(refsDir, "provider_references.json"))
+				if err != nil {
+					return nil, fmt.Errorf("failed to create JSON file: %v", err)
+				}
+				encoder := json.NewEncoder(jsonFile)
+				encoder.SetIndent("", "  ")
+				if err := encoder.Encode(providerRefs); err != nil {
+					jsonFile.Close()
+					return nil, fmt.Errorf("failed to write JSON: %v", err)
+				}
+				jsonFile.Close()
+
+				// Create CSV file
+				csvFile, err := os.Create(filepath.Join(refsDir, "provider_groups.csv"))
+				if err != nil {
+					return nil, fmt.Errorf("failed to create CSV file: %v", err)
+				}
+				writer := csv.NewWriter(csvFile)
+
+				// Write CSV header
+				if err := writer.Write([]string{"provider_group_id", "npi", "tin_type", "tin_value"}); err != nil {
+					csvFile.Close()
+					return nil, fmt.Errorf("failed to write CSV header: %v", err)
+				}
+
+				// Build reference map and write CSV records
+				referenceMap := make(map[int][]ProviderGroup)
+				for _, ref := range providerRefs {
+					referenceMap[ref.ProviderGroupID] = ref.ProviderGroups
+					for _, group := range ref.ProviderGroups {
+						for _, npi := range group.GetNPIStrings() {
+							if npi != "" && npi != "null" && npi != "<nil>" {
+								record := []string{
+									fmt.Sprintf("%d", ref.ProviderGroupID),
+									npi,
+									group.TIN.Type,
+									group.TIN.Value,
+								}
+								if err := writer.Write(record); err != nil {
+									csvFile.Close()
+									return nil, fmt.Errorf("failed to write CSV record: %v", err)
+								}
+							}
+						}
+					}
+				}
+
+				writer.Flush()
+				csvFile.Close()
+
+				fmt.Printf("Extracted %d provider references\n", len(providerRefs))
+				return referenceMap, nil
+			} else {
+				// Skip other top-level fields
+				if err := decoder.Decode(new(interface{})); err != nil {
+					return nil, fmt.Errorf("failed to skip field %s: %v", str, err)
+				}
+			}
 		}
 	}
 
-	// Open and decompress the file
+	return nil, fmt.Errorf("provider_references section not found in file")
+}
+
+// processInNetworkItems streams and processes the in_network section
+func processInNetworkItems(inputFile string, outputDir string, writerPool *FileWriterPool, referenceMap map[int][]ProviderGroup) error {
 	file, err := os.Open(inputFile)
 	if err != nil {
 		return fmt.Errorf("failed to open file: %v", err)
@@ -492,10 +998,10 @@ func ProcessFile(inputFile, outputDir string, r2Config *R2Config, remotePrefix s
 	}
 	defer gzReader.Close()
 
-	// Create a JSON decoder that reads from the gzip reader
 	decoder := json.NewDecoder(gzReader)
+	decoder.UseNumber()
 
-	// Read opening brace
+	// Read opening brace of the root object
 	t, err := decoder.Token()
 	if err != nil {
 		return fmt.Errorf("failed to read opening brace: %v", err)
@@ -504,55 +1010,42 @@ func ProcessFile(inputFile, outputDir string, r2Config *R2Config, remotePrefix s
 		return fmt.Errorf("expected opening brace, got %v", t)
 	}
 
-	// Process the JSON stream
+	// Skip fields until we find in_network
 	for decoder.More() {
 		t, err := decoder.Token()
 		if err != nil {
 			return fmt.Errorf("failed to read token: %v", err)
 		}
 
-		// Process each top-level field
-		key, ok := t.(string)
-		if !ok {
-			continue
-		}
+		if str, ok := t.(string); ok {
+			if str == "in_network" {
+				// Found in_network field, expect array start
+				t, err := decoder.Token()
+				if err != nil {
+					return fmt.Errorf("failed to read in_network array start: %v", err)
+				}
+				if delim, ok := t.(json.Delim); !ok || delim != '[' {
+					return fmt.Errorf("expected array start, got %v", t)
+				}
 
-		switch key {
-		case "provider_references":
-			// Start of provider_references array
-			t, err := decoder.Token()
-			if err != nil {
-				return fmt.Errorf("failed to read provider_references array start: %v", err)
-			}
-			if delim, ok := t.(json.Delim); !ok || delim != '[' {
-				return fmt.Errorf("expected array start, got %v", t)
-			}
-			if err := streamProviderReferences(decoder, outputDir, writerPool); err != nil {
-				return fmt.Errorf("failed to process provider references: %v", err)
-			}
+				// Create in_network directory
+				inNetworkDir := filepath.Join(outputDir, "in_network")
+				if err := os.MkdirAll(inNetworkDir, 0755); err != nil {
+					return fmt.Errorf("failed to create in_network directory: %v", err)
+				}
 
-		case "in_network":
-			// Start of in_network array
-			t, err := decoder.Token()
-			if err != nil {
-				return fmt.Errorf("failed to read in_network array start: %v", err)
-			}
-			if delim, ok := t.(json.Delim); !ok || delim != '[' {
-				return fmt.Errorf("expected array start, got %v", t)
-			}
-			if err := streamInNetworkItems(decoder, outputDir, writerPool); err != nil {
-				return fmt.Errorf("failed to process in-network items: %v", err)
-			}
-
-		default:
-			// Skip other fields
-			if _, err := decoder.Token(); err != nil {
-				return fmt.Errorf("failed to skip value: %v", err)
+				// Stream and process in_network items
+				return streamInNetworkItems(decoder, outputDir, writerPool, referenceMap)
+			} else {
+				// Skip other top-level fields
+				if err := decoder.Decode(new(interface{})); err != nil {
+					return fmt.Errorf("failed to skip field %s: %v", str, err)
+				}
 			}
 		}
 	}
 
-	return nil
+	return fmt.Errorf("in_network section not found in file")
 }
 
 // Helper function for max
@@ -653,4 +1146,12 @@ func (pool *FileWriterPool) Close() error {
 	}
 
 	return lastErr
+}
+
+// Add this helper function
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
 }
