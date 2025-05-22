@@ -655,9 +655,10 @@ func writeNegotiatedRates(item InNetworkItem, rate NegotiatedRate, price Negotia
 // Worker function to process in-network items
 func processInNetworkItem(item InNetworkItem, outputDir string, writerPool *FileWriterPool, itemCount *int64) error {
 	count := atomic.AddInt64(itemCount, 1)
-	if count%1000 == 0 {
-		fmt.Printf("Processing in-network item %d: %s\n", count, item.BillingCode)
-	}
+
+	// Print each item being processed
+	fmt.Printf("Processing in-network item %d: %s\n", count, item.BillingCode)
+	os.Stdout.Sync() // Ensure output is flushed immediately
 
 	// Create filename based on billing code
 	filename := filepath.Join(outputDir, "in_network", fmt.Sprintf("in_network_%s.csv", item.BillingCode))
