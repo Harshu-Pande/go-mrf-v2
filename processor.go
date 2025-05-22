@@ -19,6 +19,12 @@ import (
 	"time"
 )
 
+// RemoteProviderReference represents a provider reference that needs to be fetched
+type RemoteProviderReference struct {
+	ProviderGroupID int    `json:"provider_group_id"`
+	Location        string `json:"location"`
+}
+
 // ProcessorConfig holds configuration for the processor
 type ProcessorConfig struct {
 	WriteBufferSize int
@@ -321,57 +327,33 @@ func (r *RateLimiter) Stop() {
 	close(r.done)
 }
 
-// fetchRemoteReference fetches and decodes a remote provider reference with retries
-func fetchRemoteReference(client *http.Client, ref RemoteReference, rateLimiter *RateLimiter) (*ProviderReference, error) {
-	maxRetries := 3
-	backoff := 1 * time.Second
+// fetchRemoteReference fetches and decodes a remote provider reference
+func fetchRemoteReference(client *http.Client, ref RemoteProviderReference) (*ProviderReference, error) {
+	// Make HTTP request
+	resp, err := client.Get(ref.Location)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch remote reference: %v", err)
+	}
+	defer resp.Body.Close()
 
-	var lastErr error
-	for retry := 0; retry < maxRetries; retry++ {
-		if retry > 0 {
-			time.Sleep(backoff)
-			backoff *= 2 // Exponential backoff
-		}
-
-		if rateLimiter != nil {
-			rateLimiter.Wait()
-		}
-
-		resp, err := client.Get(ref.URL)
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d: failed to fetch remote reference: %v", retry+1, err)
-			continue
-		}
-
-		// Check for rate limiting or server errors that should trigger retry
-		if resp.StatusCode == 429 || resp.StatusCode >= 500 {
-			resp.Body.Close()
-			lastErr = fmt.Errorf("attempt %d: server returned status %d", retry+1, resp.StatusCode)
-			continue
-		}
-
-		if resp.StatusCode != http.StatusOK {
-			resp.Body.Close()
-			return nil, fmt.Errorf("remote reference returned status %d", resp.StatusCode)
-		}
-
-		var remoteRef ProviderReference
-		err = json.NewDecoder(resp.Body).Decode(&remoteRef)
-		resp.Body.Close()
-		if err != nil {
-			lastErr = fmt.Errorf("attempt %d: failed to decode remote reference: %v", retry+1, err)
-			continue
-		}
-
-		remoteRef.ProviderGroupID = ref.ProviderGroupID
-		return &remoteRef, nil
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("received non-200 status code: %d", resp.StatusCode)
 	}
 
-	return nil, fmt.Errorf("failed after %d retries: %v", maxRetries, lastErr)
+	// Read and parse response
+	var provRef ProviderReference
+	if err := json.NewDecoder(resp.Body).Decode(&provRef); err != nil {
+		return nil, fmt.Errorf("failed to decode provider reference: %v", err)
+	}
+
+	// Set the provider group ID from the reference
+	provRef.ProviderGroupID = ref.ProviderGroupID
+
+	return &provRef, nil
 }
 
-// processRemoteReferences processes remote references in parallel with improved error handling
-func processRemoteReferences(refs []RemoteReference) (map[int][]ProviderGroup, error) {
+// processRemoteReferences processes remote references in parallel
+func processRemoteReferences(refs []RemoteProviderReference) (map[int][]ProviderGroup, error) {
 	if len(refs) == 0 {
 		return make(map[int][]ProviderGroup), nil
 	}
@@ -380,17 +362,10 @@ func processRemoteReferences(refs []RemoteReference) (map[int][]ProviderGroup, e
 	resultMap := make(map[int][]ProviderGroup)
 	var resultMutex sync.Mutex
 
-	// Create error tracking
-	var errorCount int32
-	var firstError atomic.Value
-
 	// Create work channel and result channel
-	workChan := make(chan RemoteReference, len(refs))
-	resultChan := make(chan RemoteReferenceResult, len(refs))
-
-	// Create rate limiter (100 requests per second)
-	rateLimiter := NewRateLimiter(100)
-	defer rateLimiter.Stop()
+	workChan := make(chan RemoteProviderReference, len(refs))
+	resultChan := make(chan *ProviderReference, len(refs))
+	errorChan := make(chan error, len(refs))
 
 	// Create HTTP client with improved configuration
 	client := &http.Client{
@@ -407,7 +382,7 @@ func processRemoteReferences(refs []RemoteReference) (map[int][]ProviderGroup, e
 
 	// Start worker goroutines
 	var wg sync.WaitGroup
-	numWorkers := min(200, len(refs))
+	numWorkers := min(200, len(refs)) // Match Python's worker count
 
 	// Create context with timeout for overall processing
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
@@ -423,20 +398,12 @@ func processRemoteReferences(refs []RemoteReference) (map[int][]ProviderGroup, e
 					if !ok {
 						return
 					}
-					remoteRef, err := fetchRemoteReference(client, ref, rateLimiter)
-					result := RemoteReferenceResult{Reference: remoteRef, Error: err}
-
-					select {
-					case resultChan <- result:
-					case <-ctx.Done():
-						return
-					}
-
+					provRef, err := fetchRemoteReference(client, ref)
 					if err != nil {
-						if atomic.AddInt32(&errorCount, 1) == 1 {
-							firstError.Store(err)
-						}
+						errorChan <- fmt.Errorf("failed to fetch provider reference %d: %v", ref.ProviderGroupID, err)
+						continue
 					}
+					resultChan <- provRef
 				case <-ctx.Done():
 					return
 				}
@@ -460,17 +427,19 @@ func processRemoteReferences(refs []RemoteReference) (map[int][]ProviderGroup, e
 	go func() {
 		wg.Wait()
 		close(resultChan)
+		close(errorChan)
 	}()
 
-	// Collect results
-	for result := range resultChan {
-		if result.Error != nil {
-			continue // Skip failed references but continue processing
-		}
+	// Collect errors
+	var fetchErrors []error
+	for err := range errorChan {
+		fetchErrors = append(fetchErrors, err)
+	}
 
-		ref := result.Reference
+	// Collect results
+	for provRef := range resultChan {
 		resultMutex.Lock()
-		resultMap[ref.ProviderGroupID] = ref.ProviderGroups
+		resultMap[provRef.ProviderGroupID] = provRef.ProviderGroups
 		resultMutex.Unlock()
 	}
 
@@ -479,10 +448,12 @@ func processRemoteReferences(refs []RemoteReference) (map[int][]ProviderGroup, e
 		return nil, fmt.Errorf("remote reference processing timed out after 10 minutes")
 	}
 
-	// If we had errors but got some results, log warning and continue
-	if errorCount > 0 {
-		firstErr := firstError.Load().(error)
-		log.Printf("Warning: %d remote references failed to process. First error: %v", errorCount, firstErr)
+	// Log any errors but continue processing
+	if len(fetchErrors) > 0 {
+		log.Printf("Warning: Failed to fetch %d remote provider references:", len(fetchErrors))
+		for _, err := range fetchErrors {
+			log.Printf("  %v", err)
+		}
 	}
 
 	return resultMap, nil
@@ -890,7 +861,6 @@ func extractProviderReferences(inputFile string, outputDir string) (map[int][]Pr
 	}
 	defer gzReader.Close()
 
-	// Create a decoder that will decode numbers as json.Number to preserve precision
 	decoder := json.NewDecoder(gzReader)
 	decoder.UseNumber()
 
@@ -918,20 +888,62 @@ func extractProviderReferences(inputFile string, outputDir string) (map[int][]Pr
 
 		if str, ok := t.(string); ok {
 			if str == "provider_references" {
-				// Found provider_references field, decode it directly
-				var providerRefs []ProviderReference
+				// Found provider_references field, decode it
+				var providerRefs []json.RawMessage
 				if err := decoder.Decode(&providerRefs); err != nil {
 					return nil, fmt.Errorf("failed to decode provider references: %v", err)
 				}
 
-				// Write to JSON file
+				// Process each provider reference
+				var processedRefs []ProviderReference
+				var remoteRefs []RemoteProviderReference
+				referenceMap := make(map[int][]ProviderGroup)
+
+				// First pass: separate local and remote references
+				for _, rawRef := range providerRefs {
+					// Try to decode as a remote reference first
+					var remoteRef RemoteProviderReference
+					if err := json.Unmarshal(rawRef, &remoteRef); err == nil && remoteRef.Location != "" {
+						remoteRefs = append(remoteRefs, remoteRef)
+						continue
+					}
+
+					// If not a remote reference, try as a regular reference
+					var ref ProviderReference
+					if err := json.Unmarshal(rawRef, &ref); err != nil {
+						return nil, fmt.Errorf("failed to decode provider reference: %v", err)
+					}
+					processedRefs = append(processedRefs, ref)
+					referenceMap[ref.ProviderGroupID] = ref.ProviderGroups
+				}
+
+				// Process remote references
+				if len(remoteRefs) > 0 {
+					fmt.Printf("Found %d remote provider references to fetch\n", len(remoteRefs))
+
+					remoteRefMap, err := processRemoteReferences(remoteRefs)
+					if err != nil {
+						return nil, fmt.Errorf("failed to process remote references: %v", err)
+					}
+
+					// Add remote references to the maps
+					for id, groups := range remoteRefMap {
+						referenceMap[id] = groups
+						processedRefs = append(processedRefs, ProviderReference{
+							ProviderGroupID: id,
+							ProviderGroups:  groups,
+						})
+					}
+				}
+
+				// Write processed references to JSON file
 				jsonFile, err := os.Create(filepath.Join(refsDir, "provider_references.json"))
 				if err != nil {
 					return nil, fmt.Errorf("failed to create JSON file: %v", err)
 				}
 				encoder := json.NewEncoder(jsonFile)
 				encoder.SetIndent("", "  ")
-				if err := encoder.Encode(providerRefs); err != nil {
+				if err := encoder.Encode(processedRefs); err != nil {
 					jsonFile.Close()
 					return nil, fmt.Errorf("failed to write JSON: %v", err)
 				}
@@ -950,10 +962,8 @@ func extractProviderReferences(inputFile string, outputDir string) (map[int][]Pr
 					return nil, fmt.Errorf("failed to write CSV header: %v", err)
 				}
 
-				// Build reference map and write CSV records
-				referenceMap := make(map[int][]ProviderGroup)
-				for _, ref := range providerRefs {
-					referenceMap[ref.ProviderGroupID] = ref.ProviderGroups
+				// Write CSV records
+				for _, ref := range processedRefs {
 					for _, group := range ref.ProviderGroups {
 						for _, npi := range group.GetNPIStrings() {
 							if npi != "" && npi != "null" && npi != "<nil>" {
@@ -975,7 +985,9 @@ func extractProviderReferences(inputFile string, outputDir string) (map[int][]Pr
 				writer.Flush()
 				csvFile.Close()
 
-				fmt.Printf("Extracted %d provider references\n", len(providerRefs))
+				fmt.Printf("Processed %d provider references (%d local, %d remote)\n",
+					len(processedRefs), len(processedRefs)-len(remoteRefs), len(remoteRefs))
+
 				return referenceMap, nil
 			} else {
 				// Skip other top-level fields
