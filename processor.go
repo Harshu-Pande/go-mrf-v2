@@ -171,7 +171,7 @@ func (pool *FileWriterPool) getOrCreateWriter(filename string) (*FileWriter, err
 	}
 
 	if info.Size() == 0 && strings.Contains(filename, "in_network_") {
-		header := "provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class\n"
+		header := "provider_reference,negotiated_rate,billing_code,billing_code_type,negotiation_arrangement,negotiated_type,billing_class,billing_code_modifier\n"
 		if _, err := writer.Write([]byte(header)); err != nil {
 			return nil, fmt.Errorf("failed to write header: %v", err)
 		}
@@ -672,15 +672,19 @@ func processInNetworkItem(item InNetworkItem, outputDir string, writerPool *File
 		for _, price := range rate.NegotiatedPrices {
 			// Process each provider reference
 			for _, providerRef := range rate.ProviderReferences {
+				// Convert billing_code_modifier array to string
+				modifiers := strings.Join(price.BillingCodeModifier, "|")
+
 				// Build the CSV record
-				record := fmt.Sprintf("%d,%f,%s,%s,%s,%s,%s\n",
+				record := fmt.Sprintf("%d,%f,%s,%s,%s,%s,%s,%s\n",
 					providerRef,
 					price.NegotiatedRate,
 					item.BillingCode,
 					item.BillingCodeType,
 					item.NegotiationArrangement,
 					price.NegotiatedType,
-					price.BillingClass)
+					price.BillingClass,
+					modifiers)
 
 				builder.WriteString(record)
 			}
