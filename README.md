@@ -45,11 +45,11 @@ cd go-mrf-v2
 # Cell 3: Set up environment and run the processor
 export PATH=$PATH:/usr/local/go/bin
 
-# For local storage only (results saved in Colab):
 cd /content/go-mrf-v2
 go build -o mrf-processor
 mkdir -p output
 
+# For local storage only (results saved in Colab):
 ./mrf-processor \
   -workers 99 \
   -buffer 4 \
